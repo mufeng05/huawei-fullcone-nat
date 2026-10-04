@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-# 兜底：每 60 秒轮询一次 Dialer1 当前 IP，与 section 比对，不一致才更新。
+# 兜底：每 60 秒比对一次 Dialer1 当前 IP 与地址池 section，不一致才更新。
+# 比对只用两条用户视图 display（只读），平时不进 system-view。
 # 与 update_pool.py 独立部署，compare-then-update 幂等。
-# 只在真正替换 section 后才打 syslog，平时静默。
+# 只在真正写入（成功或失败）后才打 syslog，平时静默。
 import ops
 import re
 
@@ -11,6 +12,34 @@ DIALER     = "Dialer1"
 SECTION_RE = re.compile(r"section\s+%s\s+(\d+\.\d+\.\d+\.\d+)" % SECTION_ID,
                         re.IGNORECASE)
 DIALER_RE  = re.compile(r"%s\s+(\d+\.\d+\.\d+\.\d+)" % DIALER)
+
+
+def get_dialer_ip(_ops, handle):
+    out, _, _ = _ops.cli.execute(handle, "display ip interface brief %s" % DIALER)
+    m = DIALER_RE.search(out or "")
+    ip = m.group(1) if m else None
+    return None if ip in (None, "0.0.0.0") else ip
+
+
+def get_section_ip(_ops, handle):
+    out, _, _ = _ops.cli.execute(handle, "display nat address-group name %s" % POOL_NAME)
+    m = SECTION_RE.search(out or "")
+    return m.group(1) if m else None
+
+
+def write_section(_ops, handle, new_ip):
+    """Rewrite the section, then read it back. Returns (ok, failed_cmd_or_None)."""
+    cmds = ["system-view",
+            "nat address-group %s" % POOL_NAME,
+            "undo section %s" % SECTION_ID,
+            "section %s %s %s" % (SECTION_ID, new_ip, new_ip),
+            "return"]
+    for cmd in cmds:
+        _, _, desc = _ops.cli.execute(handle, cmd)
+        if desc != "Success" and not cmd.startswith("undo section"):
+            _ops.cli.execute(handle, "return")
+            return False, "%s (%s)" % (cmd, desc)
+    return get_section_ip(_ops, handle) == new_ip, None
 
 
 def ops_condition(_ops):
@@ -26,28 +55,19 @@ def ops_execute(_ops):
         return 0
 
     try:
-        out, _, _ = _ops.cli.execute(
-            handle, "display ip interface brief %s" % DIALER)
-        m = DIALER_RE.search(out or "")
-        new_ip = m.group(1) if m else None
-        if not new_ip or new_ip == "0.0.0.0":
+        new_ip = get_dialer_ip(_ops, handle)
+        if not new_ip:
             return 0
-
-        _ops.cli.execute(handle, "system-view")
-        _ops.cli.execute(handle, "nat address-group %s" % POOL_NAME)
-        out, _, _ = _ops.cli.execute(handle, "display this")
-
-        m = SECTION_RE.search(out or "")
-        current = m.group(1) if m else None
-
+        current = get_section_ip(_ops, handle)
         if current == new_ip:
             return 0
 
-        _ops.cli.execute(handle, "undo section %s" % SECTION_ID)
-        _ops.cli.execute(handle, "section %s %s %s" %
-                         (SECTION_ID, new_ip, new_ip))
-        _ops.syslog("update_poll done: %s %s -> %s" %
-                    (DIALER, current, new_ip))
+        ok, failed = write_section(_ops, handle, new_ip)
+        if ok:
+            _ops.syslog("update_poll done: %s %s -> %s" % (DIALER, current, new_ip))
+        else:
+            _ops.syslog("update_poll FAILED: %s %s -> %s, failed at %s" %
+                        (DIALER, current, new_ip, failed or "verify"))
     finally:
         _ops.cli.close(handle)
     return 0
