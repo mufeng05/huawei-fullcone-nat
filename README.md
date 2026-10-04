@@ -46,9 +46,12 @@ Internet
 ip route-static 0.0.0.0 0 Dialer1
 ```
 
-带不带下一跳都可以：脚本只把这个事件当触发器，新 IP 直接读 Dialer1 接口（`display ip interface brief Dialer1`），不依赖事件参数 `_para_Nexthop`。
+新 IP 优先读 Dialer1 接口（`display ip interface brief Dialer1`），读不到时才退回事件参数 `_para_Nexthop`：
 
-> 旧版脚本把 `_para_Nexthop` 当作新 IP，要求默认路由不能带下一跳（不带时 VRP 会把 Dialer1 自己的 IP 填进 Nexthop 字段）；显式写了 `ip route-static 0 0 Dialer1 <peer-ip>` 的话会把 PPP 对端 IP 写进地址池。现在已经没有这个限制。
+- 默认路由**不带**下一跳（推荐）：VRP 会把 Dialer1 自己的 IP 填进路由的 Nexthop 字段，两个来源一致，任一个都是对的（实测历史日志里三次重拨取到的都是正确的公网 IP）
+- 默认路由**带了**下一跳（`ip route-static 0 0 Dialer1 <peer-ip>`）：`_para_Nexthop` 是 PPP 对端 IP。只要接口能读到就不受影响，日志里会记一条 `note: event nexthop ... differs from Dialer1 address ...`；但万一接口也读不到，就会退回到对端 IP，所以还是建议不带下一跳
+
+> 旧版脚本只用 `_para_Nexthop`，默认路由带下一跳时会把 PPP 对端 IP 写进地址池。
 
 ### NAT 配置
 
@@ -105,23 +108,26 @@ nat server debian-ssh protocol tcp global interface Dialer1 52200 inside 192.168
 
 ### `update_pool.py`（主脚本，事件触发）
 
-订阅 `RM / RM_ADD_DEFAULTRT` 事件，过滤 `Ifname=Dialer1, AfType=IPv4`。PPPoE 上线触发默认路由添加 → 读 Dialer1 接口当前 IP（`display ip interface brief Dialer1`）和地址池当前 section（`display nat address-group name p2p_pool`）→ 不一致才进配置模式 `undo section` + `section` → 回读确认。
+订阅 `RM / RM_ADD_DEFAULTRT` 事件，过滤 `Ifname=Dialer1, AfType=IPv4`。PPPoE 上线触发默认路由添加 → 读 Dialer1 接口当前 IP（读不到时退回 `_para_Nexthop`）和地址池当前 section（`display nat address-group name p2p_pool`）→ 不一致才进配置模式 `undo section` + `section` → 回读确认。
 
-每次触发打一条 `update_pool start: ...`（事件里的下一跳、Dialer1 IP、当前 section），写入后再打一条 `done` 或 `FAILED`。
+事件很少触发，所以每一步都记日志：事件里的下一跳、读到的接口行和 section 行、比对结果和新 IP 的来源、每条写入命令的返回状态和输出，最后是 `done` 或 `FAILED`。
 
 ### `update_pool_polling.py`（兜底，定时轮询）
 
 `timer.relative("tick", 60)` 每 60 秒触发一次，走与主脚本相同的比对 + 更新流程。比对只用两条用户视图的 `display`，平时不进配置模式。
 
-静默运行，**只在真正写入后**才打一条 syslog：`update_poll done: ...` 或 `update_poll FAILED: ...`，避免日志刷屏。
+平时静默；**只有真正要写入时**（很少，通常是事件脚本错过了，比如开机时）才和主脚本一样逐步记日志，前缀是 `update_poll`。
 
-两个脚本的写入都会检查每条命令的返回状态，写完再读一次 section 确认；失败时日志里会写明是哪条命令失败（或者回读不一致），下一次触发会自动重试。
+两个脚本的写入都会检查每条命令的返回状态，最后以回读的 section 为准：
+
+- 回读正确 → `done`。如果中途有命令报错但 section 已经是对的（比如事件脚本和轮询脚本恰好同时在写，后写的那个会报错），会在 `done` 后面注明哪条命令报过错
+- 回读不对 → `FAILED: ..., failed at <命令> (<desc>)`，或者命令都成功但回读不对时是 `failed at verify`；下一次触发会自动重试
 
 实测（V600R026C00SPC100）：
 
 - IP 没变时，新的轮询每分钟往日志文件里写 8 行（6 行 OPS RESTCONF 记录 + 2 行命令记录），旧版是 12 行，而且旧版每分钟都会进一次 `system-view` 和地址池视图
-- 一次执行的耗时主要是 OPS 自身的开销：定时器触发后要 6 秒左右才执行到第一条命令，命令本身 1～2 秒，所以少几条命令对耗时影响不大
-- 平时 PPPoE 重拨时，事件脚本 3～6 秒内完成比对和更新（历史日志里三次重拨的数据）
+- 一次执行的耗时主要是 OPS 自身的开销：定时器触发后要 6 秒左右才执行到第一条命令，命令本身 1～2 秒，所以少几条命令对耗时影响不大。写入时比旧版多两条命令（写前读 section、写后回读），实测 8 条命令 2 秒内执行完，和旧版在同一量级
+- 平时 PPPoE 重拨时，旧版事件脚本 3～6 秒内完成比对和更新（历史日志里三次重拨的数据）
 
 ### 脚本日志在哪看
 
@@ -209,13 +215,17 @@ undo shutdown
 more logfile/log.log | include update_pool
 ```
 
-应该看到两行：
+应该看到完整执行轨迹（中间还有每条写入命令的 `cmd=... desc='Success'`），开头和结尾是：
 ```
-update_pool start: route nexthop='NEW_IP', Dialer1='NEW_IP', section='OLD_IP'
+update_pool start: event nexthop='NEW_IP'
+update_pool read 'display ip interface brief Dialer1': desc='Success' line='Dialer1  NEW_IP/32  up  up  --'
+update_pool read 'display nat address-group name p2p_pool': desc='Success' line='section 0 OLD_IP OLD_IP'
+update_pool compare: section='OLD_IP' new_ip='NEW_IP' (from Dialer1)
+...
 update_pool done: Dialer1 OLD_IP -> NEW_IP
 ```
 
-如果重拨后 IP 没变，只会有 `start` 一行，正常。
+如果重拨后 IP 没变，到 `compare` 那一行就结束，正常。
 
 轮询脚本：等 60 秒以上，如果 IP 没变化不打日志，正常。手工改个错误 section 看下次轮询会不会自愈（测试期间全锥出口用的是错误 IP，内网最长会断网 60 秒）：
 
@@ -331,8 +341,10 @@ display logbuffer | include LCPNEGOSTATE
 more logfile/log.log | include update_pool|update_poll
 ```
 
-- `update_pool start: ... Dialer1=None` → 没读到 Dialer1 的 IP（接口名不对，或者 PPPoE 还没拿到地址）
-- `... FAILED: ..., failed at <命令> (<desc>)` → 这条命令执行失败
+- `read ...: line="no match, out=..."` → 没解析出来，后面附了原始输出的末尾，可以对照看是接口名 / 地址池名不对，还是这个版本的输出格式变了
+- `compare: ... new_ip=None` → 接口和事件参数都没拿到 IP（接口名不对，或者 PPPoE 还没拿到地址）
+- `compare: ... (from _para_Nexthop)` → 接口没读到，用的是事件参数；默认路由带了下一跳的话这里会是对端 IP
+- `... FAILED: ..., failed at <命令> (<desc>)` → 这条命令执行失败，回读也不对
 - `... FAILED: ..., failed at verify` → 命令都返回成功，但回读的 section 跟预期不一致
 
 常见原因：
