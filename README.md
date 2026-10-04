@@ -117,6 +117,22 @@ nat server debian-ssh protocol tcp global interface Dialer1 52200 inside 192.168
 
 两个脚本的写入都会检查每条命令的返回状态，写完再读一次 section 确认；失败时日志里会写明是哪条命令失败（或者回读不一致），下一次触发会自动重试。
 
+实测（V600R026C00SPC100）：
+
+- IP 没变时，新的轮询每分钟往日志文件里写 8 行（6 行 OPS RESTCONF 记录 + 2 行命令记录），旧版是 12 行，而且旧版每分钟都会进一次 `system-view` 和地址池视图
+- 一次执行的耗时主要是 OPS 自身的开销：定时器触发后要 6 秒左右才执行到第一条命令，命令本身 1～2 秒，所以少几条命令对耗时影响不大
+- 平时 PPPoE 重拨时，事件脚本 3～6 秒内完成比对和更新（历史日志里三次重拨的数据）
+
+### 脚本日志在哪看
+
+`_ops.syslog()` 写出来的是 `OPS/6/OPS_LOG_USERDEFINED_INFORMATION`（informational 级别）。logbuffer 通道缺省只记录 warning 及以上（`display info-center channel 4` 可以看到 `default ... warning`），所以**脚本日志不在 `display logbuffer` 里**，只写进 flash 上的日志文件：
+
+```
+more logfile/log.log | include update_pool
+```
+
+日志文件轮转后，旧内容在 `logfile/log_*.log.zip` 里，可以用 SFTP 下载后解压搜索。不建议为了看脚本日志把 OPS 模块的 logbuffer 级别调到 informational（`info-center source OPS channel logbuffer log level informational`）：OPS 每执行一条命令还会产生 notification 级别的 RESTCONF 记录，会一起涌进 logbuffer。
+
 ### 为什么分两个脚本不合并
 
 OPS 的 `correlate("rtAdd or tick")` 跨类型组合（event + timer）实测无效——assistant State 卡在 `init`，两个 Subscribe 都 success 但整体不进 ready。Huawei 文档"多条件关系组合"官方示例只展示同类组合（两个 cli 事件 AND），timer + event 跨类型 OR 没明确支持。所以拆开各自独立 assistant 部署。
@@ -190,7 +206,7 @@ undo shutdown
 等几秒：
 
 ```
-display logbuffer | include update_pool
+more logfile/log.log | include update_pool
 ```
 
 应该看到两行：
@@ -216,6 +232,27 @@ return
 update_poll done: Dialer1 1.1.1.1 -> <真实 Dialer1 IP>
 ```
 
+### 不影响生产的验证方法
+
+上面两种验证都会让内网短暂断网。如果不方便（比如人不在路由器旁边），可以用环回口 + 临时地址池验证脚本本身，全程不碰 Dialer1、`p2p_pool` 和 NAT 策略：
+
+1. 建一个环回口和一个不被任何 NAT 策略引用的临时地址池，地址用文档专用网段（RFC 5737），section 先故意写错：
+   ```
+   system-view
+   interface LoopBack100
+    ip address 192.0.2.1 255.255.255.255
+    quit
+   nat address-group zz_test_pool1
+    section 0 192.0.2.9 192.0.2.9
+    return
+   ```
+2. 复制一份脚本改名（比如 `zz_poll_test.py`），把常量改成 `POOL_NAME = "zz_test_pool1"`、`DIALER = "LoopBack100"`，日志前缀也改掉以便区分，按上面的方法上传、安装、注册。测事件脚本时可以临时把 `ops_condition` 换成 `timer.relative`，不用重拨
+3. 一分钟内 section 应该变成 192.0.2.1；再把环回口地址改成 192.0.2.2，模拟换 IP，下一分钟 section 应该跟着变
+4. 测写入失败：再建一个临时池占住某个地址，然后把环回口改成这个地址。不同地址池的 section 不能重叠（会报 `A NAT address section conflict occurs`），脚本应该打出 `FAILED ... failed at section ... (Error: Failed to execute the command.)`
+5. 清理：`undo script-assistant python ...`、`ops uninstall file ...`、`undo nat address-group ...`、`undo interface LoopBack100`，再用 SFTP 删掉上传的文件
+
+注意：如果开了 `configuration file auto-save`，测试期间的中间状态可能已经被自动保存进启动配置。清理完先确认 `display saved-configuration` 里没有测试残留，有的话执行一次 `save`。
+
 ## 验证全锥 NAT 语义
 
 光改 section 不够，还要确认行为真的是全锥。在内网 PC 上跑 [NatTypeTester](https://github.com/HMBSbige/NatTypeTester)（Windows）或 `stunclient`（Linux/Mac）。
@@ -235,9 +272,6 @@ update_poll done: Dialer1 1.1.1.1 -> <真实 Dialer1 IP>
 ```
 # 三元组映射的空闲老化时间，默认 60 秒；RFC 4787 要求 UDP 映射空闲不少于 2 分钟，推荐 5 分钟
 firewall server-map aging-time full-cone 300
-
-# logbuffer 默认只有 512 条，很容易把脚本日志冲掉
-info-center logbuffer size 10240
 ```
 
 老化调长后，空闲映射会多保留一会儿，端口占用会上升（实测一个家庭网络从约 3% 升到约 7%），可以用 `display nat resource usage address-group name p2p_pool` 观察。每条三元组映射占 1 个公网端口，在 `display firewall server-map` 里对应 `FullCone Src` + `FullCone Dst` 两条表项。
@@ -258,7 +292,11 @@ PPPoE 单公网 IP 场景，地址池 IP 就是 Dialer1 IP，无法回避。原�
 
 ### 重启后有几分钟空窗
 
-开机时 OPS 维护助手要过几分钟才真正执行（实测事件 13:04:31 触发，13:10:45 才开始执行）。如果重启后 PPPoE 拿到了新 IP，这段时间里地址池还是配置文件里保存的旧 IP，走 `allow_fullcone` 的流量会用旧 IP 出去，内网相当于断网，直到脚本执行完。平时只重拨、不重启时 OPS 已经在运行，按设计是事件触发秒级响应，最晚也会被 60 秒轮询兜住。
+开机时 PPPoE 往往比 OPS 维护助手先就绪。实测一次重启：设备 13:04:10 启动，13:04:37 PPPoE 拨上并产生 `RM_ADD_DEFAULTRT`，但两个维护助手到 13:10:45～13:11:31 才加载完成，**这次事件被错过了**，主脚本没有执行。
+
+如果重启后 PPPoE 换了 IP，地址池在这段时间里还是启动配置里的旧 IP，走 `allow_fullcone` 的流量会用旧 IP 出去，内网相当于断网，要等 OPS 就绪后由轮询脚本修正（开机后约 7～8 分钟）。着急的话可以手工执行 `undo section 0` + `section 0 <新IP> <新IP>`。
+
+平时只重拨、不重启时不受影响：OPS 已经在运行，事件脚本 3～6 秒内完成更新（见"脚本说明"里的实测）。
 
 ### `set_model_type("YANG")` 必须在 `cli.open()` 前调用
 
@@ -288,9 +326,9 @@ display logbuffer | include LCPNEGOSTATE
 
 ### Running times > 0 但 section 没变
 
-看脚本日志：
+看脚本日志（在日志文件里，不在 logbuffer 里，见"脚本日志在哪看"）：
 ```
-display logbuffer | include update_pool|update_poll
+more logfile/log.log | include update_pool|update_poll
 ```
 
 - `update_pool start: ... Dialer1=None` → 没读到 Dialer1 的 IP（接口名不对，或者 PPPoE 还没拿到地址）
@@ -300,7 +338,7 @@ display logbuffer | include update_pool|update_poll
 常见原因：
 - `set_model_type` 没调，CLI 子视图命令全失败
 - `nat address-group` 名字或 section 编号不对
-- logbuffer 太小，日志已经被别的日志冲掉了（见"可选调优"）
+- 新 IP 和别的地址池的 section 重叠（`A NAT address section conflict occurs`，日志里是 `failed at section ... (Error: Failed to execute the command.)`）
 
 ### 想关掉脚本
 
